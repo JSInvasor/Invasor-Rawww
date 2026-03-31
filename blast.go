@@ -42,13 +42,11 @@ const (
 	flagEndHeaders byte = 0x4
 	flagACK        byte = 0x1
 
-	settingHeaderTableSize     uint16 = 0x1
-	settingEnablePush          uint16 = 0x2
-	settingMaxConcurrentStream uint16 = 0x3
-	settingInitialWindowSize   uint16 = 0x4
-	settingMaxFrameSize        uint16 = 0x5
+	settingHeaderTableSize   uint16 = 0x1
+	settingEnablePush        uint16 = 0x2
+	settingInitialWindowSize uint16 = 0x4
+	settingMaxFrameSize      uint16 = 0x5
 
-	defaultMaxStreams   = 100
 	defaultMaxFrameSize = 16384
 	defaultWindowSize   = 65535
 	largeWindowSize     = 1 << 30
@@ -88,9 +86,7 @@ type h2Conn struct {
 
 	writeMu sync.Mutex
 
-	nextStreamID  atomic.Uint32
-	activeStreams atomic.Int32
-	maxStreams    int32
+	nextStreamID atomic.Uint32
 	maxFrameSize int32
 	alive        atomic.Bool
 
@@ -158,12 +154,11 @@ func newH2Conn(addr string, tlsCfg *tls.Config, headerBlock, body []byte, stats 
 
 	c := &h2Conn{
 		conn:         tc,
-		bw:           bufio.NewWriterSize(tc, 256*1024),
-		br:           bufio.NewReaderSize(tc, 128*1024),
+		bw:           bufio.NewWriterSize(tc, 512*1024),
+		br:           bufio.NewReaderSize(tc, 64*1024),
 		headerBlock:  headerBlock,
 		body:         body,
 		noBody:       len(body) == 0,
-		maxStreams:    defaultMaxStreams,
 		maxFrameSize: defaultMaxFrameSize,
 		stats:        stats,
 	}
@@ -205,7 +200,6 @@ func newH2Conn(addr string, tlsCfg *tls.Config, headerBlock, body []byte, stats 
 
 	go c.readerLoop()
 	go c.flusherLoop()
-	go c.streamReaper() // reclaim leaked streams
 
 	return c, nil
 }
@@ -244,10 +238,7 @@ func (c *h2Conn) applySettings(payload []byte) {
 		id := binary.BigEndian.Uint16(payload[:2])
 		val := binary.BigEndian.Uint32(payload[2:6])
 		payload = payload[6:]
-		switch id {
-		case settingMaxConcurrentStream:
-			c.maxStreams = int32(val)
-		case settingMaxFrameSize:
+		if id == settingMaxFrameSize {
 			c.maxFrameSize = int32(val)
 		}
 	}
@@ -267,25 +258,6 @@ func (c *h2Conn) readFrame() (ftype, flags byte, streamID uint32, payload []byte
 		_, err = io.ReadFull(c.br, payload)
 	}
 	return
-}
-
-// ─── Stream Reaper: reclaim leaked/stale streams ───
-
-func (c *h2Conn) streamReaper() {
-	t := time.NewTicker(3 * time.Second)
-	defer t.Stop()
-	for range t.C {
-		if !c.alive.Load() {
-			return
-		}
-		active := c.activeStreams.Load()
-		max := c.maxStreams
-		// If >75% full, reclaim half — prevents deadlock from leaked streams
-		if active > max*3/4 {
-			reclaim := active / 2
-			c.activeStreams.Add(-reclaim)
-		}
-	}
 }
 
 // ─── Reader goroutine ───
@@ -343,7 +315,6 @@ func (c *h2Conn) readerLoop() {
 			}
 			if fl&flagEndStream != 0 && sid != 0 {
 				c.stats.ok.Add(1)
-				c.activeStreams.Add(-1)
 			}
 
 		case frameData:
@@ -357,13 +328,11 @@ func (c *h2Conn) readerLoop() {
 			}
 			if fl&flagEndStream != 0 && sid != 0 {
 				c.stats.ok.Add(1)
-				c.activeStreams.Add(-1)
 			}
 
 		case frameRSTStream:
 			if sid != 0 {
 				c.stats.fail.Add(1)
-				c.activeStreams.Add(-1)
 			}
 
 		case frameWindowUpdate:
@@ -387,18 +356,12 @@ func (c *h2Conn) flusherLoop() {
 	}
 }
 
-// ─── Send request (zero-alloc hot path) ───
+// ─── Send request (zero-alloc, fire-and-forget) ───
 
 func (c *h2Conn) sendRequest() bool {
 	if !c.alive.Load() {
 		return false
 	}
-	// Allow 2x overshoot over maxStreams — server will RST excess,
-	// but this prevents deadlock from leaked stream counters
-	if c.activeStreams.Load() >= c.maxStreams*2 {
-		return false
-	}
-	c.activeStreams.Add(1)
 
 	id := c.nextStreamID.Add(2) - 2
 	if id > 0x7FFFFFFE {
@@ -596,16 +559,16 @@ func (b *Blaster) runH2(ctx context.Context, addrs []string, port string, tlsCfg
 		os.Exit(1)
 	}
 
-	fmt.Printf("\033[32m[\u2713] %d/%d connections ready  (max_concurrent_streams=%d)\033[0m\n\n",
-		len(conns), b.cfg.Conns, conns[0].maxStreams)
+	fmt.Printf("\033[32m[\u2713] %d/%d connections ready  (fire-and-forget mode)\033[0m\n\n",
+		len(conns), b.cfg.Conns)
 
 	start := time.Now()
 	numConns := len(conns)
 
-	// Background reconnector
+	// Aggressive reconnector — GOAWAY kills conn, we rebuild fast
 	go func() {
 		for ctx.Err() == nil {
-			time.Sleep(2 * time.Second)
+			time.Sleep(500 * time.Millisecond)
 			for i := 0; i < numConns; i++ {
 				if !conns[i].alive.Load() {
 					addr := net.JoinHostPort(addrs[i%len(addrs)], port)
