@@ -25,7 +25,6 @@ import (
 	"golang.org/x/net/http2/hpack"
 )
 
-// ─── HTTP/2 Frame Constants ───
 const (
 	h2ClientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
@@ -42,17 +41,20 @@ const (
 	flagEndHeaders byte = 0x4
 	flagACK        byte = 0x1
 
-	settingHeaderTableSize   uint16 = 0x1
-	settingEnablePush        uint16 = 0x2
-	settingInitialWindowSize uint16 = 0x4
-	settingMaxFrameSize      uint16 = 0x5
+	settingHeaderTableSize     uint16 = 0x1
+	settingEnablePush          uint16 = 0x2
+	settingMaxConcurrentStream uint16 = 0x3
+	settingInitialWindowSize   uint16 = 0x4
+	settingMaxFrameSize        uint16 = 0x5
 
+	defaultMaxStreams   = 100
 	defaultMaxFrameSize = 16384
 	defaultWindowSize   = 65535
 	largeWindowSize     = 1 << 30
 )
 
 // ─── Stats (cache-line padded) ───
+
 type Stats struct {
 	sent  atomic.Int64
 	_pad0 [56]byte
@@ -62,6 +64,7 @@ type Stats struct {
 }
 
 // ─── Config ───
+
 type Config struct {
 	URL        string
 	Workers    int
@@ -72,12 +75,12 @@ type Config struct {
 	Headers    http.Header
 	SkipVerify bool
 	ForceHTTP1 bool
-	Debug      bool
+	Pipeline   int // multiplier for max_concurrent_streams
 }
 
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 //  Raw HTTP/2 Connection
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 
 type h2Conn struct {
 	conn net.Conn
@@ -87,6 +90,9 @@ type h2Conn struct {
 	writeMu sync.Mutex
 
 	nextStreamID atomic.Uint32
+	activeStreams atomic.Int32
+	maxStreams    int32
+	pipelineMax  int32 // maxStreams * pipeline multiplier
 	maxFrameSize int32
 	alive        atomic.Bool
 
@@ -117,8 +123,6 @@ func writeWinUpdate(w *bufio.Writer, streamID uint32, inc int) {
 	w.Write(b[:])
 }
 
-// ─── Dial ───
-
 func dialTCP(addr string) (net.Conn, error) {
 	d := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 60 * time.Second}
 	c, err := d.Dial("tcp", addr)
@@ -129,27 +133,22 @@ func dialTCP(addr string) (net.Conn, error) {
 	return c, nil
 }
 
-// ─── Create raw HTTP/2 connection ───
+// ─── Create connection ───
 
-func newH2Conn(addr string, tlsCfg *tls.Config, headerBlock, body []byte, stats *Stats, debug bool) (*h2Conn, error) {
+func newH2Conn(addr string, tlsCfg *tls.Config, headerBlock, body []byte, pipeline int, stats *Stats) (*h2Conn, error) {
 	raw, err := dialTCP(addr)
 	if err != nil {
-		return nil, fmt.Errorf("dial: %w", err)
+		return nil, err
 	}
 
 	tc := tls.Client(raw, tlsCfg)
-	hsCtx, hsCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer hsCancel()
-	if err := tc.HandshakeContext(hsCtx); err != nil {
+	if err := tc.HandshakeContext(context.Background()); err != nil {
 		raw.Close()
-		return nil, fmt.Errorf("tls: %w", err)
+		return nil, err
 	}
-
-	// ALPN check — warn but don't fail (some servers work without it)
-	proto := tc.ConnectionState().NegotiatedProtocol
-	if proto != "h2" && proto != "" {
+	if tc.ConnectionState().NegotiatedProtocol != "h2" {
 		tc.Close()
-		return nil, fmt.Errorf("ALPN negotiated %q instead of h2", proto)
+		return nil, fmt.Errorf("ALPN: got %q, want h2", tc.ConnectionState().NegotiatedProtocol)
 	}
 
 	c := &h2Conn{
@@ -159,18 +158,20 @@ func newH2Conn(addr string, tlsCfg *tls.Config, headerBlock, body []byte, stats 
 		headerBlock:  headerBlock,
 		body:         body,
 		noBody:       len(body) == 0,
+		maxStreams:    defaultMaxStreams,
 		maxFrameSize: defaultMaxFrameSize,
 		stats:        stats,
 	}
 	c.nextStreamID.Store(1)
 	c.alive.Store(true)
+	c.pipelineMax = int32(defaultMaxStreams * pipeline)
 
-	// ── Connection preface ──
+	// Connection preface
 	c.bw.WriteString(h2ClientPreface)
 
-	// ── SETTINGS ──
+	// Our SETTINGS
 	settings := [][2]uint32{
-		{uint32(settingHeaderTableSize), 65536},
+		{uint32(settingHeaderTableSize), 0},
 		{uint32(settingEnablePush), 0},
 		{uint32(settingInitialWindowSize), largeWindowSize},
 		{uint32(settingMaxFrameSize), defaultMaxFrameSize},
@@ -183,54 +184,65 @@ func newH2Conn(addr string, tlsCfg *tls.Config, headerBlock, body []byte, stats 
 		c.bw.Write(buf[:])
 	}
 
-	// ── Connection WINDOW_UPDATE ──
 	writeWinUpdate(c.bw, 0, largeWindowSize-defaultWindowSize)
-	if err := c.bw.Flush(); err != nil {
-		tc.Close()
-		return nil, fmt.Errorf("preface flush: %w", err)
-	}
+	c.bw.Flush()
 
-	// ── Server handshake with timeout ──
-	tc.SetReadDeadline(time.Now().Add(10 * time.Second))
 	if err := c.handshake(); err != nil {
 		tc.Close()
-		return nil, fmt.Errorf("h2 handshake: %w", err)
+		return nil, err
 	}
-	tc.SetReadDeadline(time.Time{}) // clear deadline
 
 	go c.readerLoop()
 	go c.flusherLoop()
+	go c.streamDecay()
 
 	return c, nil
 }
 
 func (c *h2Conn) handshake() error {
+	c.conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	defer c.conn.SetReadDeadline(time.Time{})
+
 	for i := 0; i < 30; i++ {
-		ft, fl, _, payload, err := c.readFrame()
+		ft, fl, _, length, err := c.readFrameHeader()
 		if err != nil {
 			return err
 		}
 		switch ft {
 		case frameSettings:
-			if fl&flagACK == 0 {
-				c.applySettings(payload)
+			if length > 0 {
+				payload := make([]byte, length)
+				if _, err := io.ReadFull(c.br, payload); err != nil {
+					return err
+				}
+				if fl&flagACK == 0 {
+					c.applySettings(payload)
+					writeFrameHdr(c.bw, 0, frameSettings, flagACK, 0)
+					c.bw.Flush()
+					return nil
+				}
+			} else if fl&flagACK == 0 {
 				writeFrameHdr(c.bw, 0, frameSettings, flagACK, 0)
 				c.bw.Flush()
 				return nil
 			}
 		case framePing:
-			if fl&flagACK == 0 && len(payload) == 8 {
+			if fl&flagACK == 0 && length == 8 {
+				var ping [8]byte
+				io.ReadFull(c.br, ping[:])
 				writeFrameHdr(c.bw, 8, framePing, flagACK, 0)
-				c.bw.Write(payload)
+				c.bw.Write(ping[:])
 				c.bw.Flush()
+			} else if length > 0 {
+				c.br.Discard(length)
 			}
-		case frameGoAway:
-			return fmt.Errorf("server sent GOAWAY during handshake")
-		case frameWindowUpdate:
-			// ignore
+		default:
+			if length > 0 {
+				c.br.Discard(length)
+			}
 		}
 	}
-	return fmt.Errorf("no SETTINGS received after 30 frames")
+	return fmt.Errorf("server did not send SETTINGS")
 }
 
 func (c *h2Conn) applySettings(payload []byte) {
@@ -238,29 +250,31 @@ func (c *h2Conn) applySettings(payload []byte) {
 		id := binary.BigEndian.Uint16(payload[:2])
 		val := binary.BigEndian.Uint32(payload[2:6])
 		payload = payload[6:]
-		if id == settingMaxFrameSize {
+		switch id {
+		case settingMaxConcurrentStream:
+			c.maxStreams = int32(val)
+			c.pipelineMax = c.maxStreams * int32(c.pipelineMax/c.maxStreams) // recalc
+		case settingMaxFrameSize:
 			c.maxFrameSize = int32(val)
 		}
 	}
 }
 
-func (c *h2Conn) readFrame() (ftype, flags byte, streamID uint32, payload []byte, err error) {
+// ─── Zero-alloc frame header reader ───
+
+func (c *h2Conn) readFrameHeader() (ftype, flags byte, streamID uint32, length int, err error) {
 	var hdr [9]byte
 	if _, err = io.ReadFull(c.br, hdr[:]); err != nil {
 		return
 	}
-	length := int(hdr[0])<<16 | int(hdr[1])<<8 | int(hdr[2])
+	length = int(hdr[0])<<16 | int(hdr[1])<<8 | int(hdr[2])
 	ftype = hdr[3]
 	flags = hdr[4]
 	streamID = binary.BigEndian.Uint32(hdr[5:]) & 0x7FFFFFFF
-	if length > 0 {
-		payload = make([]byte, length)
-		_, err = io.ReadFull(c.br, payload)
-	}
 	return
 }
 
-// ─── Reader goroutine ───
+// ─── Reader goroutine: zero-allocation, handles protocol ───
 
 func (c *h2Conn) readerLoop() {
 	defer func() {
@@ -269,41 +283,63 @@ func (c *h2Conn) readerLoop() {
 	}()
 
 	var winConsumed int64
+	var smallBuf [64]byte
 
 	for {
-		ft, fl, sid, payload, err := c.readFrame()
+		ft, fl, sid, length, err := c.readFrameHeader()
 		if err != nil {
 			return
 		}
 
 		switch ft {
 		case frameSettings:
-			if fl&flagACK == 0 {
-				c.applySettings(payload)
-				c.writeMu.Lock()
-				writeFrameHdr(c.bw, 0, frameSettings, flagACK, 0)
-				c.bw.Flush()
-				c.writeMu.Unlock()
+			if length > 0 && length <= len(smallBuf) {
+				if _, err := io.ReadFull(c.br, smallBuf[:length]); err != nil {
+					return
+				}
+				if fl&flagACK == 0 {
+					c.applySettings(smallBuf[:length])
+					c.writeMu.Lock()
+					writeFrameHdr(c.bw, 0, frameSettings, flagACK, 0)
+					c.bw.Flush()
+					c.writeMu.Unlock()
+				}
+			} else if length > 0 {
+				c.br.Discard(length)
 			}
 
 		case framePing:
-			if fl&flagACK == 0 && len(payload) == 8 {
+			if fl&flagACK == 0 && length == 8 {
+				if _, err := io.ReadFull(c.br, smallBuf[:8]); err != nil {
+					return
+				}
 				c.writeMu.Lock()
 				writeFrameHdr(c.bw, 8, framePing, flagACK, 0)
-				c.bw.Write(payload)
+				c.bw.Write(smallBuf[:8])
 				c.bw.Flush()
 				c.writeMu.Unlock()
+			} else if length > 0 {
+				c.br.Discard(length)
 			}
 
 		case frameGoAway:
+			if length > 0 {
+				c.br.Discard(length)
+			}
 			return
 
 		case frameHeaders:
+			if length > 0 {
+				c.br.Discard(length)
+			}
 			if fl&flagEndHeaders == 0 {
 				for {
-					cft, cfl, _, _, cerr := c.readFrame()
+					cft, cfl, _, clen, cerr := c.readFrameHeader()
 					if cerr != nil {
 						return
+					}
+					if clen > 0 {
+						c.br.Discard(clen)
 					}
 					if cft != frameContinuation {
 						return
@@ -315,10 +351,14 @@ func (c *h2Conn) readerLoop() {
 			}
 			if fl&flagEndStream != 0 && sid != 0 {
 				c.stats.ok.Add(1)
+				c.activeStreams.Add(-1)
 			}
 
 		case frameData:
-			winConsumed += int64(len(payload))
+			if length > 0 {
+				c.br.Discard(length)
+			}
+			winConsumed += int64(length)
 			if winConsumed > 1<<20 {
 				c.writeMu.Lock()
 				writeWinUpdate(c.bw, 0, int(winConsumed))
@@ -328,20 +368,27 @@ func (c *h2Conn) readerLoop() {
 			}
 			if fl&flagEndStream != 0 && sid != 0 {
 				c.stats.ok.Add(1)
+				c.activeStreams.Add(-1)
 			}
 
 		case frameRSTStream:
+			if length > 0 {
+				c.br.Discard(length)
+			}
 			if sid != 0 {
 				c.stats.fail.Add(1)
+				c.activeStreams.Add(-1)
 			}
 
-		case frameWindowUpdate:
-			// ignore
+		default:
+			if length > 0 {
+				c.br.Discard(length)
+			}
 		}
 	}
 }
 
-// ─── Flusher ───
+// ─── Flusher: batch writes → fewer syscalls ───
 
 func (c *h2Conn) flusherLoop() {
 	t := time.NewTicker(500 * time.Microsecond)
@@ -356,12 +403,32 @@ func (c *h2Conn) flusherLoop() {
 	}
 }
 
-// ─── Send request (zero-alloc, fire-and-forget) ───
+// ─── Stream decay: reclaim stale streams every second ───
+
+func (c *h2Conn) streamDecay() {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for range t.C {
+		if !c.alive.Load() {
+			return
+		}
+		active := c.activeStreams.Load()
+		if active > c.pipelineMax/2 {
+			c.activeStreams.Store(c.pipelineMax / 4)
+		}
+	}
+}
+
+// ─── Send request: pipeline-controlled fire ───
 
 func (c *h2Conn) sendRequest() bool {
 	if !c.alive.Load() {
 		return false
 	}
+	if c.activeStreams.Load() >= c.pipelineMax {
+		return false
+	}
+	c.activeStreams.Add(1)
 
 	id := c.nextStreamID.Add(2) - 2
 	if id > 0x7FFFFFFE {
@@ -377,7 +444,6 @@ func (c *h2Conn) sendRequest() bool {
 	} else {
 		writeFrameHdr(c.bw, len(c.headerBlock), frameHeaders, flagEndHeaders, id)
 		c.bw.Write(c.headerBlock)
-
 		maxFr := int(c.maxFrameSize)
 		body := c.body
 		for len(body) > 0 {
@@ -405,9 +471,9 @@ func (c *h2Conn) close() {
 	c.conn.Close()
 }
 
-// ═══════════════════════════════════════════════
-//  HPACK encoder — encode once, replay forever
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
+//  HPACK — encode once, replay forever
+// ═══════════════════════════════════════════════════
 
 func encodeHPACK(method, scheme, authority, path string, headers http.Header) []byte {
 	var buf bytes.Buffer
@@ -427,9 +493,9 @@ func encodeHPACK(method, scheme, authority, path string, headers http.Header) []
 	return buf.Bytes()
 }
 
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 //  Blaster
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 
 type Blaster struct {
 	cfg   *Config
@@ -460,14 +526,15 @@ func (b *Blaster) Run() {
 		proto = "HTTP/1.1 (raw)"
 	}
 
-	fmt.Printf("\n\033[1;36m\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\033[0m\n")
-	fmt.Printf("\033[1;36m\u2551         INVASOR-RAWWW \u2014 MAX RPS MODE         \u2551\033[0m\n")
-	fmt.Printf("\033[1;36m\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d\033[0m\n\n")
+	fmt.Printf("\n\033[1;36m╔══════════════════════════════════════════════╗\033[0m\n")
+	fmt.Printf("\033[1;36m║         INVASOR-RAWWW — MAX RPS MODE         ║\033[0m\n")
+	fmt.Printf("\033[1;36m╚══════════════════════════════════════════════╝\033[0m\n\n")
 	fmt.Printf("  \033[1mTarget  :\033[0m %s\n", b.cfg.URL)
 	fmt.Printf("  \033[1mProtocol:\033[0m %s\n", proto)
 	fmt.Printf("  \033[1mMethod  :\033[0m %s\n", b.cfg.Method)
 	fmt.Printf("  \033[1mWorkers :\033[0m %d\n", b.cfg.Workers)
 	fmt.Printf("  \033[1mConns   :\033[0m %d\n", b.cfg.Conns)
+	fmt.Printf("  \033[1mPipeline:\033[0m %dx\n", b.cfg.Pipeline)
 	fmt.Printf("  \033[1mDuration:\033[0m %s\n", b.cfg.Duration)
 	fmt.Println()
 
@@ -481,13 +548,12 @@ func (b *Blaster) Run() {
 		}
 	}
 
-	// Resolve all IPs for round-robin
 	addrs, err := net.LookupHost(host)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "DNS resolve failed: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("  \033[1mResolved:\033[0m %s → %v\n\n", host, addrs)
+	addr := net.JoinHostPort(addrs[0], port)
 
 	tlsCfg := &tls.Config{
 		InsecureSkipVerify: b.cfg.SkipVerify,
@@ -498,85 +564,66 @@ func (b *Blaster) Run() {
 
 	if b.cfg.ForceHTTP1 {
 		tlsCfg.NextProtos = []string{"http/1.1"}
-		b.runH1(ctx, addrs, port, tlsCfg, u)
+		b.runH1(ctx, addr, tlsCfg, u)
 	} else {
 		tlsCfg.NextProtos = []string{"h2"}
-		b.runH2(ctx, addrs, port, tlsCfg, u)
+		b.runH2(ctx, addr, tlsCfg, u)
 	}
 }
 
-// ─── HTTP/2 Raw Frame Mode ───
+// ─── HTTP/2 ───
 
-func (b *Blaster) runH2(ctx context.Context, addrs []string, port string, tlsCfg *tls.Config, u *url.URL) {
+func (b *Blaster) runH2(ctx context.Context, addr string, tlsCfg *tls.Config, u *url.URL) {
 	path := u.RequestURI()
 	if path == "" {
 		path = "/"
 	}
 	headerBlock := encodeHPACK(b.cfg.Method, u.Scheme, u.Host, path, b.cfg.Headers)
 
-	fmt.Print("\033[33m[*] Establishing HTTP/2 connections...\033[0m\n")
+	fmt.Print("\033[33m[*] Establishing HTTP/2 connections...\033[0m\r")
 
 	conns := make([]*h2Conn, 0, b.cfg.Conns)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	var connErrors atomic.Int32
-	var lastErr atomic.Value
 	sem := make(chan struct{}, 32)
 
 	for i := 0; i < b.cfg.Conns; i++ {
 		wg.Add(1)
 		sem <- struct{}{}
-		addr := net.JoinHostPort(addrs[i%len(addrs)], port)
-		go func(a string) {
+		go func() {
 			defer func() { <-sem; wg.Done() }()
-			c, err := newH2Conn(a, tlsCfg, headerBlock, b.cfg.Body, &b.stats, b.cfg.Debug)
+			c, err := newH2Conn(addr, tlsCfg, headerBlock, b.cfg.Body, b.cfg.Pipeline, &b.stats)
 			if err != nil {
-				connErrors.Add(1)
-				lastErr.Store(err.Error())
-				if b.cfg.Debug {
-					fmt.Fprintf(os.Stderr, "  \033[31m[conn err] %v\033[0m\n", err)
-				}
 				return
 			}
 			mu.Lock()
 			conns = append(conns, c)
 			mu.Unlock()
-		}(addr)
+		}()
 	}
 	wg.Wait()
 
-	errCount := connErrors.Load()
-	if errCount > 0 {
-		errMsg := ""
-		if v := lastErr.Load(); v != nil {
-			errMsg = v.(string)
-		}
-		fmt.Printf("  \033[33m[!] %d/%d connections failed: %s\033[0m\n", errCount, b.cfg.Conns, errMsg)
-	}
-
 	if len(conns) == 0 {
-		fmt.Fprintln(os.Stderr, "\n\033[31m[✗] All connections failed. Try -debug for details or -http1 for HTTP/1.1 mode\033[0m")
+		fmt.Fprintln(os.Stderr, "\nFailed to establish any connections")
 		os.Exit(1)
 	}
 
-	fmt.Printf("\033[32m[\u2713] %d/%d connections ready  (fire-and-forget mode)\033[0m\n\n",
-		len(conns), b.cfg.Conns)
+	fmt.Printf("\033[2K\033[32m[✓] %d/%d connections  (max_streams=%d, pipeline=%dx → %d slots/conn)\033[0m\n\n",
+		len(conns), b.cfg.Conns, conns[0].maxStreams, b.cfg.Pipeline, conns[0].pipelineMax)
 
 	start := time.Now()
 	numConns := len(conns)
 
-	// Aggressive reconnector — GOAWAY kills conn, we rebuild fast
+	// Reconnector
 	go func() {
 		for ctx.Err() == nil {
 			time.Sleep(500 * time.Millisecond)
 			for i := 0; i < numConns; i++ {
 				if !conns[i].alive.Load() {
-					addr := net.JoinHostPort(addrs[i%len(addrs)], port)
-					nc, err := newH2Conn(addr, tlsCfg, headerBlock, b.cfg.Body, &b.stats, b.cfg.Debug)
+					nc, err := newH2Conn(addr, tlsCfg, headerBlock, b.cfg.Body, b.cfg.Pipeline, &b.stats)
 					if err == nil {
-						old := conns[i]
+						conns[i].close()
 						conns[i] = nc
-						old.close()
 					}
 				}
 			}
@@ -627,9 +674,9 @@ func (b *Blaster) runH2(ctx context.Context, addrs []string, port string, tlsCfg
 	}
 }
 
-// ─── HTTP/1.1 Raw Mode ───
+// ─── HTTP/1.1 ───
 
-func (b *Blaster) runH1(ctx context.Context, addrs []string, port string, tlsCfg *tls.Config, u *url.URL) {
+func (b *Blaster) runH1(ctx context.Context, addr string, tlsCfg *tls.Config, u *url.URL) {
 	path := u.RequestURI()
 	if path == "" {
 		path = "/"
@@ -666,7 +713,7 @@ func (b *Blaster) runH1(ctx context.Context, addrs []string, port string, tlsCfg
 
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go func(idx int) {
+		go func() {
 			defer wg.Done()
 
 			var conn net.Conn
@@ -677,7 +724,6 @@ func (b *Blaster) runH1(ctx context.Context, addrs []string, port string, tlsCfg
 				if conn != nil {
 					conn.Close()
 				}
-				addr := net.JoinHostPort(addrs[idx%len(addrs)], port)
 				raw, err := dialTCP(addr)
 				if err != nil {
 					return false
@@ -738,10 +784,10 @@ func (b *Blaster) runH1(ctx context.Context, addrs []string, port string, tlsCfg
 				resp.Body.Close()
 				b.stats.ok.Add(1)
 			}
-		}(i)
+		}()
 	}
 
-	fmt.Printf("\033[2K\033[32m[\u2713] %d workers started\033[0m\n\n", numWorkers)
+	fmt.Printf("\033[2K\033[32m[✓] %d workers started\033[0m\n\n", numWorkers)
 
 	go b.printStats(ctx, start)
 	wg.Wait()
@@ -777,13 +823,13 @@ func (b *Blaster) printResult(start time.Time) {
 		successPct = float64(totalOK) / float64(totalSent) * 100
 	}
 
-	fmt.Printf("\n\n\033[1;36m\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 RESULT \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\033[0m\n")
-	fmt.Printf("\033[1;36m\u2502\033[0m  Duration   : %-32.2fs\033[1;36m\u2502\033[0m\n", elapsed.Seconds())
-	fmt.Printf("\033[1;36m\u2502\033[0m  Total Sent : %-32d\033[1;36m\u2502\033[0m\n", totalSent)
-	fmt.Printf("\033[1;36m\u2502\033[0m  Success    : %-21d \033[32m(%.1f%%)\033[0m       \033[1;36m\u2502\033[0m\n", totalOK, successPct)
-	fmt.Printf("\033[1;36m\u2502\033[0m  Failed     : %-32d\033[1;36m\u2502\033[0m\n", totalFail)
-	fmt.Printf("\033[1;36m\u2502\033[0m  Avg RPS    : \033[1;32m%-32.0f\033[0m\033[1;36m\u2502\033[0m\n", avgRPS)
-	fmt.Printf("\033[1;36m\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\033[0m\n\n")
+	fmt.Printf("\n\n\033[1;36m┌─────────────────── RESULT ───────────────────┐\033[0m\n")
+	fmt.Printf("\033[1;36m│\033[0m  Duration   : %-32.2fs\033[1;36m│\033[0m\n", elapsed.Seconds())
+	fmt.Printf("\033[1;36m│\033[0m  Total Sent : %-32d\033[1;36m│\033[0m\n", totalSent)
+	fmt.Printf("\033[1;36m│\033[0m  Success    : %-21d \033[32m(%.1f%%)\033[0m       \033[1;36m│\033[0m\n", totalOK, successPct)
+	fmt.Printf("\033[1;36m│\033[0m  Failed     : %-32d\033[1;36m│\033[0m\n", totalFail)
+	fmt.Printf("\033[1;36m│\033[0m  Avg RPS    : \033[1;32m%-32.0f\033[0m\033[1;36m│\033[0m\n", avgRPS)
+	fmt.Printf("\033[1;36m└──────────────────────────────────────────────┘\033[0m\n\n")
 }
 
 // ─── main ───
@@ -795,14 +841,14 @@ func main() {
 
 	urlFlag := flag.String("url", "", "Target URL (required)")
 	workersFlag := flag.Int("workers", 4000, "Goroutine workers")
-	connsFlag := flag.Int("conns", 64, "Connections")
+	connsFlag := flag.Int("conns", 64, "HTTP/2 connections")
 	durationFlag := flag.Duration("duration", 30*time.Second, "Duration (e.g. 30s, 2m)")
 	methodFlag := flag.String("method", "GET", "HTTP method")
 	bodyFlag := flag.String("body", "", "Request body")
 	headersFlag := flag.String("headers", "", "Headers: Key:Value,Key2:Value2")
 	skipVerifyFlag := flag.Bool("skip-verify", true, "Skip TLS verification")
 	http1Flag := flag.Bool("http1", false, "Force HTTP/1.1")
-	debugFlag := flag.Bool("debug", false, "Print connection errors")
+	pipelineFlag := flag.Int("pipeline", 10, "Pipeline multiplier for max_concurrent_streams (1=strict, 10=aggressive)")
 	flag.Parse()
 
 	if *urlFlag == "" {
@@ -843,6 +889,6 @@ func main() {
 		Headers:    headers,
 		SkipVerify: *skipVerifyFlag,
 		ForceHTTP1: *http1Flag,
-		Debug:      *debugFlag,
+		Pipeline:   *pipelineFlag,
 	}}).Run()
 }
