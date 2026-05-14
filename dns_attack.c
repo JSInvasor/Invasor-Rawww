@@ -120,7 +120,7 @@ void* dns_attack(void* arg) {
             { close(raw_fd); raw_fd = -1; }
     }
 
-    int sndbuf = 2 * 1024 * 1024;
+    int sndbuf = 4 * 1024 * 1024;
 
     int fds[DNS_SOCKS];
     int active = 0;

